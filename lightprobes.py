@@ -99,10 +99,17 @@ def fetch_integration_callback(name):
         return fn
     
     
-def call_integration(name, data):
+def pre_bake_hook(name, context, probe):
+    fn = fetch_integration_callback(name)
+    ret = None
+    if fn:
+        ret = fn(context, probe)
+    return ret
+    
+def post_bake_hook(name, context, data, pre_bake_data):
     fn = fetch_integration_callback(name)
     if fn:
-        fn(data)
+        fn(context, data, pre_bake_data)
 
 
 def hide_object(ob):
@@ -148,8 +155,10 @@ def setup_material(ob):
     for node in list(tree.nodes):
         tree.nodes.remove(node)
         
+    #diffuse = tree.nodes.new("ShaderNodeBsdfGlossy")
     diffuse = tree.nodes.new("ShaderNodeBsdfDiffuse")
     diffuse.inputs["Color"].default_value = (1, 1, 1, 1)
+    diffuse.inputs["Roughness"].default_value = 1.0
     diffuse_out = diffuse.outputs["BSDF"]
     
     output = tree.nodes.new("ShaderNodeOutputMaterial")
@@ -165,15 +174,8 @@ def setup_material(ob):
     bake_node.image = texture
     
     
-    for _ in range(len(ob.data.uv_layers)):
-        bpy.ops.mesh.uv_texture_remove()
-        
-    bpy.ops.mesh.uv_texture_add()
-    ob.data.uv_layers[0].name = "lightmap"
     ob.data.uv_textures["lightmap"].active = True
     
-    with active(ob):
-        bpy.ops.uv.smart_project()    
     
     color_uvmap = tree.nodes.new("ShaderNodeUVMap")
     color_uvmap.uv_map = "lightmap"
@@ -223,10 +225,30 @@ def get_lightmap(ob):
 
 def add_lightprobe():
     with no_interfere_ctx():
-        bpy.ops.mesh.primitive_ico_sphere_add(subdivisions=3)
+        bpy.ops.mesh.primitive_cube_add()
         probe = bpy.context.object
+        
+        for _ in range(len(probe.data.uv_layers)):
+            bpy.ops.mesh.uv_texture_remove()
+        
+        bpy.ops.mesh.uv_texture_add()
+        probe.data.uv_layers[0].name = "lightmap"
+        
+        bpy.ops.uv.lightmap_pack(PREF_CONTEXT="ALL_FACES",
+                PREF_PACK_IN_ONE=True, PREF_NEW_UVLAYER=False,
+                PREF_APPLY_IMAGE=False, PREF_IMG_PX_SIZE=512, PREF_BOX_DIV=12,
+                PREF_MARGIN_DIV=0.1)
+        
+        bpy.ops.object.modifier_add(type="SUBSURF")
+        bpy.context.object.modifiers["Subsurf"].levels = 4
+        
+        bpy.ops.object.modifier_add(type="TRIANGULATE")
+        bpy.ops.object.convert(target='MESH')
+
+    
         probe.scale = mathutils.Vector((0.3, 0.3, 0.3))
         bpy.ops.object.shade_smooth()
+        
         
     probe.name = "lightprobe-" + uuid4().hex
     return probe
@@ -252,17 +274,14 @@ def get_lightprobe_coefficients(probe, theta_res, phi_res):
 
 
 
-def sample_image(image, loc):
-    """ samples a blender location at a particular xy integer location """
-    chan = image.channels
-    width, height = image.size
-    
+def sample_image(channels, width, height, pixel_data, loc):
+    """ samples a blender location at a particular xy integer location """    
     x, y = loc[0], loc[1]
     
-    pix_loc = int((y * width * chan) + x * chan)
-    r = image.pixels[pix_loc + 0]
-    g = image.pixels[pix_loc + 1]
-    b = image.pixels[pix_loc + 2]
+    pix_loc = int((y * width * channels) + x * channels)
+    r = pixel_data[pix_loc + 0]
+    g = pixel_data[pix_loc + 1]
+    b = pixel_data[pix_loc + 2]
      
     return mathutils.Color((r, g, b))
     
@@ -309,11 +328,16 @@ def bilinear_interpolate(image, uv):
     ur_uv = mathutils.Vector((right_coord, top_coord))
     ul_uv = mathutils.Vector((left_coord, top_coord))
     
-    lower_left = mathutils.Vector(sample_image(image, ll_uv))
-    lower_right = mathutils.Vector(sample_image(image, lr_uv))
-    upper_right = mathutils.Vector(sample_image(image, ur_uv))
-    upper_left = mathutils.Vector(sample_image(image, ul_uv))
+    pixel_data = image.pixels[:]
+    chan = image.channels
+    width, height = image.size
     
+    lower_left = mathutils.Vector(sample_image(chan, width, height, pixel_data, ll_uv))
+    lower_right = mathutils.Vector(sample_image(chan, width, height, pixel_data, lr_uv))
+    upper_right = mathutils.Vector(sample_image(chan, width, height, pixel_data, ur_uv))
+    upper_left = mathutils.Vector(sample_image(chan, width, height, pixel_data, ul_uv))
+    
+    del pixel_data
     
     top = upper_left.lerp(upper_right, lerp_x)
     bottom = lower_left.lerp(lower_right, lerp_x)
@@ -478,6 +502,7 @@ def sample_lightmap(ob, lightmap, face, loc):
     mesh = ob.data
     uvs = mesh.tessface_uv_textures[0].data[face.index]
     location_uv = loc[0] * uvs.uv1 + loc[1] * uvs.uv2 + loc[2] * uvs.uv3
+    
     return bilinear_interpolate(lightmap, location_uv)
     
     
@@ -497,9 +522,20 @@ class LightProbeConfigPanel(bpy.types.Panel):
         # TODO: i would like to make this a search dropdown that will
         # autocomplete the operator name
         row = layout.row()
-        fn = fetch_integration_callback(scene.lightprobe.callback)
-        row.alert = fn is None
-        row.prop(scene.lightprobe, "callback")
+        name = scene.lightprobe.pre_bake_hook
+        fn = fetch_integration_callback(name)
+        row.alert = bool(name and fn is None)
+        row.prop(scene.lightprobe, "pre_bake_hook")
+        
+        row = layout.row()
+        name = scene.lightprobe.post_bake_hook
+        fn = fetch_integration_callback(name)
+        row.alert = bool(name and fn is None)
+        row.prop(scene.lightprobe, "post_bake_hook")
+        
+        layout.operator(BakeAllOperator.bl_idname)
+        
+        layout.operator(ResizeAllOperator.bl_idname)
     
     
 class LightProbePanel(bpy.types.Panel):
@@ -539,15 +575,51 @@ class BakeOperator(bpy.types.Operator):
 
     def execute(self, context):
         probe = context.object
+        
+        scene_settings = context.scene.lightprobe
         settings = probe.lightprobe
+        
+        ret = pre_bake_hook(scene_settings.pre_bake_hook, context, probe)
+        
         coeffs = get_lightprobe_coefficients(probe, settings.theta_res,
                 settings.phi_res)
         set_coeff_prop(probe, coeffs)
         lp_data = get_all_lightprobe_data()
         write_lightprobe_data(lp_data)
         
-        name = context.scene.lightprobe.callback
-        call_integration(name, lp_data)
+        post_bake_hook(scene_settings.post_bake_hook, context, lp_data, ret)
+        
+        return {"FINISHED"}
+    
+    
+class BakeAllOperator(bpy.types.Operator):
+    bl_idname = "object.bake_all_lightprobes"
+    bl_label = "Bake All Light Probes"
+
+    def execute(self, context):
+        override = context.copy()
+        for probe in all_active_lightprobes():
+            override["object"] = probe
+            bpy.ops.object.bake_lightprobe(override)
+        
+        return {"FINISHED"}
+    
+    
+class ResizeAllOperator(bpy.types.Operator):
+    bl_idname = "object.resize_all_lightprobes"
+    bl_label = "Resize Light Probes"
+    bl_options = {"REGISTER", "UNDO"}
+    
+    size = p.FloatProperty(name="Units", default=1)
+    
+    def invoke(self, context, event):
+        return self.execute(context)
+
+    def execute(self, context):
+        dimensions = mathutils.Vector((self.size, self.size, self.size))
+        
+        for probe in all_active_lightprobes():
+            probe.dimensions = dimensions
         
         return {"FINISHED"}
 
@@ -559,6 +631,7 @@ class LightProbeOperator(bpy.types.Operator):
     def execute(self, context):
         probe = add_lightprobe()
         hide_object(probe)
+        probe.show_x_ray = True
         
         with active(probe):
             setup_material(probe)
@@ -567,7 +640,8 @@ class LightProbeOperator(bpy.types.Operator):
 
 
 class SceneProperties(bpy.types.PropertyGroup):
-    callback = p.StringProperty(name="Export Callback", description="""Call \
+    pre_bake_hook = p.StringProperty(name="Pre-bake hook")
+    post_bake_hook = p.StringProperty(name="Post-bake hook", description="""Call \
 this function with lightprobe data.  Used for integrating with other plugins.""")
     
 class ProbeProperties(bpy.types.PropertyGroup):
@@ -590,9 +664,8 @@ def unregister():
     del bpy.types.Scene.lightprobe
     
 
-if __name__ in ("__main__", "plugin"):
-    try:
-        unregister()
-    except:
-        pass
-    register()
+try:
+    unregister()
+except:
+    pass
+register()
