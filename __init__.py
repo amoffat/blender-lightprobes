@@ -295,27 +295,45 @@ def setup_lightprobe_material(ob):
     ob.data.materials.append(mat)
         
 
-
-
 @contextmanager
 def no_interfere_ctx():
-    old_selected_objects = bpy.context.selected_objects
-    active_object = bpy.context.active_object
+    """ allows us to perform operations without affecting our selected or active
+    objects """
+    ctx = bpy.context
+    old_selected_objects = ctx.selected_objects
+    active_object = ctx.active_object
     try:
         yield
     finally:
-        for obj in bpy.context.selected_objects:
+        for obj in ctx.selected_objects:
             obj.select = False
         for obj in old_selected_objects:
-            obj.select = True
-        bpy.context.scene.objects.active = active_object
-    
-    
+            if obj.name in bpy.data.objects:
+                obj.select = True
+
+        if active_object and active_object.name in bpy.data.objects:
+            ctx.scene.objects.active = active_object
+
 @contextmanager
-def active(ob):
+def active_and_selected(ob):
+    ctx = bpy.context
+    with selected(ob):
+        ctx.scene.objects.active = ob
+        yield
+
+def deselect(ctx):
+    for obj in ctx.selected_objects:
+        obj.select = False
+
+@contextmanager
+def selected(obs):
+    ctx = bpy.context
     with no_interfere_ctx():
-        ob.select = True
-        bpy.context.scene.objects.active = ob
+        deselect(ctx)
+        if not isinstance(obs, (list, tuple)):
+            obs = [obs]
+        for ob in obs:
+            ob.select = True
         yield
     
 def hide_all(scene):
@@ -397,7 +415,7 @@ def add_cubemap_probe():
 
 
 def bake(ob):
-    with active(ob):
+    with active_and_selected(ob):
         scene = bpy.context.scene
 
         cycles = scene.cycles
@@ -794,7 +812,7 @@ class BakeOperator(bpy.types.Operator):
         return cycles
 
     def execute(self, context):
-        probe = context.object
+        probe = context.active_object
         scene = context.scene
         
         settings = scene.lightprobe
@@ -815,10 +833,9 @@ class BakeAllOperator(bpy.types.Operator):
         all_probes = all_active_lightprobes()
         ret = pre_bake_hook(scene_settings.pre_bake_hook, context, all_probes)
         
-        override = context.copy()
         for probe in all_probes:
-            override["object"] = probe
-            bpy.ops.object.bake_lightprobe(override)
+            with active_and_selected(probe):
+                bpy.ops.object.bake_lightprobe()
         
         lp_data = get_all_lightprobe_data()
         write_lightprobe_data(lp_data)
@@ -856,7 +873,7 @@ class LightProbeOperator(bpy.types.Operator):
         hide_object(probe)
         probe.show_x_ray = True
         
-        with active(probe):
+        with active_and_selected(probe):
             setup_lightprobe_material(probe)
             
         return {"FINISHED"}
