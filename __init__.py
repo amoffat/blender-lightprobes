@@ -3,7 +3,7 @@ import importlib
 import bpy
 import mathutils
 from os.path import join, exists
-from os import mkdir
+import os
 from mathutils import Vector, Quaternion, Euler
 from contextlib import contextmanager
 from uuid import uuid4
@@ -11,8 +11,12 @@ from bpy.utils import register_module, unregister_module
 from bpy import props as p
 import json
 import inspect
+from collections import OrderedDict
 import sys
+from functools import partial
+import tempfile
 from pyhull.delaunay import DelaunayTri as Delaunay
+import struct
 
 
 
@@ -32,15 +36,17 @@ game engine.",
 JSON_FILE_NAME = "lightprobes.json"
 FAILSAFE_OFFSET = 0.00001
 BAKE_SIZE = 32
+CUBEMAP_EXTENSION = "cube"
+CUBEMAP_FORMAT = "exr"
 
-CUBEMAP_DIRECTION_LOOKUP = {
-    "posx": Quaternion((0.5, 0.5, -0.5, -0.5)),
-    "negx": Quaternion((0.5, 0.5, 0.5, 0.5)),
-    "posy": Quaternion((0, 0.0, -1.0, 0.0)),
-    "negy": Quaternion((0.0, 0.0, 0.0, -1.0)),
-    "posz": Quaternion((0, 0, -0.7071067690849304, -0.70710688829422)),
-    "negz": Quaternion((-0.70710688829422, -0.7071067690849304, 0, 0.0)),
-}
+CUBEMAP_DIRECTION_LOOKUP = OrderedDict((
+    ("posx", Quaternion((0.5, 0.5, -0.5, -0.5))),
+    ("negx", Quaternion((0.5, 0.5, 0.5, 0.5))),
+    ("posy", Quaternion((0, 0.0, -1.0, 0.0))),
+    ("negy", Quaternion((0.0, 0.0, 0.0, -1.0))),
+    ("posz", Quaternion((0, 0, -0.7071067690849304, -0.70710688829422))),
+    ("negz", Quaternion((-0.70710688829422, -0.7071067690849304, 0, 0.0))),
+))
 
 # http://cseweb.ucsd.edu/~ravir/papers/envmap/envmap.pdf
 spherical_harmonics = {
@@ -155,30 +161,63 @@ def values(values):
             
 
 
-def render_cubemap(scene, ob, size, get_filename, progress_update=None):
-    bpy.ops.object.camera_add()
-    cam = bpy.context.active_object
-    
-    cam.data.lens_unit = "FOV"
-    cam.data.angle = pi/2
-    cam.location = ob.location
-    cam.rotation_mode = "QUATERNION"
+def render_cubemap(ctx, h, ob, size, progress_update=None):
+    scene = ctx.scene
+
+
+    @contextmanager
+    def temp_camera():
+        bpy.ops.object.camera_add()
+        cam = ctx.active_object
+        
+        cam.data.lens_unit = "FOV"
+        cam.data.angle = pi/2
+        cam.location = ob.location
+        cam.rotation_mode = "QUATERNION"
+
+        try:
+            with no_interfere_ctx():
+                yield cam
+        finally:
+            scene.objects.unlink(cam)
+
+
+    filepaths = []
+    name = ob.cubemap.name
 
     def render(direction):
-        cam.rotation_quaternion = CUBEMAP_DIRECTION_LOOKUP[direction]
-        filepath = get_filename(direction)
-        with values({scene.render: {"resolution_x": size, "resolution_y": size,
-                "filepath": filepath}, scene: {"camera": cam},
-                scene.render.image_settings: {"file_format": "OPEN_EXR"},
-                ob: {"hide": True}}):
-            bpy.ops.render.render(animation=False, write_still=True)
+
+        with temp_camera() as cam:
+            cam.scale.x *= -1
+            cam.rotation_quaternion = CUBEMAP_DIRECTION_LOOKUP[direction]
+
+            filename = name + "-" + direction + ".exr"
+            filepath = join(tempfile.gettempdir(), filename)
+
+            with values({scene.render: {"resolution_x": size, "resolution_y": size,
+                    "filepath": filepath}, scene: {"camera": cam},
+                    scene.render.image_settings: {"file_format": "OPEN_EXR"},
+                    ob: {"hide": True}}):
+                bpy.ops.render.render(animation=False, write_still=True)
+
+        return filepath
         
+
     for direction in CUBEMAP_DIRECTION_LOOKUP.keys():
         if progress_update:
             progress_update()
-        render(direction)
+        filepath = render(direction)
+        filepaths.append(filepath)
         
     bpy.ops.object.delete()
+
+    # concatenate all of our directions together into a single env file
+    # containing all 6 cube faces
+    for filepath in filepaths:
+        with open(filepath, "rb") as j:
+            face = j.read()
+            h.write(struct.pack("<I", len(face)))
+            h.write(face)
         
 
 def get_or_create_probe_file():
@@ -722,10 +761,35 @@ class CubemapProbePanel(bpy.types.Panel):
     def draw(self, context):
         ob = context.object
         layout = self.layout
+        c = ob.cubemap
         
-        layout.prop(ob.cubemap, "name")
-        layout.prop(ob.cubemap, "sky_only")
-        layout.prop(ob.cubemap, "size")
+        layout.prop(c, "name")
+        layout.prop(c, "sky_only")
+        layout.prop(c, "size")
+
+        can_set_range = not c.single_frame and not c.whole_range
+
+        col = layout.column()
+        col.enabled = can_set_range
+
+        row = col.row()
+        row.alert = c.start_frame > c.end_frame
+
+        row.prop(c, "start_frame")
+        row.prop(c, "end_frame")
+
+        row = layout.row()
+        row.prop(c, "fps")
+
+        row = layout.row()
+        col = row.column()
+        col.enabled = not c.whole_range
+        col.prop(c, "single_frame")
+
+        col = row.column()
+        col.enabled = not c.single_frame
+        col.prop(c, "whole_range")
+
         layout.operator(BakeCubemapOperator.bl_idname)
     
     
@@ -766,35 +830,79 @@ class BakeCubemapOperator(bpy.types.Operator):
     def execute(self, context):
         probe = context.object
         scene = context.scene
-        size = probe.cubemap.size
+        cube = probe.cubemap
+        size = cube.size
         
-        dir = bpy.path.abspath(join(scene.lightprobe.cubemap_dir,
-                probe.cubemap.name))
-        if not exists(dir):
-            mkdir(dir)        
-        
-        def get_filename(direction):
-            name = "%s.exr" % direction
-            path = join(dir, name)
-            return path
-        
-        def update_gen():
+        cubemap_dir = bpy.path.abspath(scene.lightprobe.cubemap_dir)
+
+        def update_gen(num_frames):
             wm = context.window_manager
-            wm.progress_begin(0, 5)
+            wm.progress_begin(0, (6*num_frames)-1)
             
-            for i in range(6):
+            for i in range(6*num_frames):
                 wm.progress_update(i)
                 yield
-        awesome = update_gen()
+
+
+        if cube.single_frame:
+            start = scene.frame_current
+            end = start
+        elif cube.whole_range:
+            start = scene.frame_start
+            end = scene.frame_end
+        else:
+            start = cube.start_frame
+            end = cube.end_frame
+
+
+        fps = scene.render.fps
+        target_fps = cube.fps
+        frame_advance = fps / target_fps
+
+
+        # figure out all the frames we actually need to render, given our custom
+        # fps
+        all_frames = [start]
+
+        cur_frame = start
+        last_frame = None
+        while cur_frame < end:
+            cur_frame = cur_frame + frame_advance
+            if int(cur_frame) == last_frame:
+                continue
+
+            all_frames.append(int(cur_frame))
+            last_frame = int(cur_frame)
+
+
+        awesome = update_gen(len(all_frames))
         update_fn = lambda: next(awesome)
+
+
+        gamma = 1.0
+
+        cubemap_out_name = "%s.%s" % (cube.name, CUBEMAP_EXTENSION)
+        cubemap_filename = join(cubemap_dir, cubemap_out_name)
+
+        out_handle = open(cubemap_filename, "wb")
+        out_handle.write(struct.pack("<ffI", fps, gamma, len(all_frames)))
+
         
-        sky_only = probe.cubemap.sky_only
         with no_interfere_ctx():
-            if sky_only:
+            restores = {
+                probe: hide_object(probe),
+            }
+            if cube.sky_only:
                 restores = hide_all(scene)
             restores[probe]()
+
+            # for each frame that this cubemap is set to render for, render all
+            # six sides of the cube map
             try:
-                render_cubemap(context.scene, probe, size, get_filename, update_fn)
+                for frame in all_frames:
+                    scene.frame_set(frame)
+                    render_cubemap(context, out_handle, probe, size, update_fn)
+
             finally:
                 for restore in restores.values():
                     restore()
@@ -888,6 +996,37 @@ class AddCubemapOperator(bpy.types.Operator):
         return {"FINISHED"}
 
 
+
+def get_field(field, default=None):
+    """ if we use a setter to set a property on an object, sometimes we need a
+    corresponding getter.  it doesn't seem to be needed in the case of a raw
+    property on the ID object, but if you use PointerProperty to a
+    PropertyGroup, blender has trouble drilling into the PropertyGroup for the
+    ID property, so we need to stupid function to get it """
+    def wrapper(self):
+        return self.get(field, default)
+    return wrapper
+
+
+def make_validator(fn, field, default=None):
+    def wrapper(self, value):
+        last_value = self.get(field, default)
+        new_value = fn(field, last_value, self, value)
+        self[field] = new_value
+    return wrapper
+
+
+def validate_max_frame(field, old_value, self, value):
+    ctx = bpy.context
+    max_frame = ctx.scene.frame_end
+    return min(value, max_frame)
+
+def validate_min_frame(field, old_value, self, value):
+    ctx = bpy.context
+    min_frame = ctx.scene.frame_start
+    return max(value, min_frame)
+
+
 class SceneProperties(bpy.types.PropertyGroup):
     pre_bake_hook = p.StringProperty(name="Pre-bake hook")
     post_bake_hook = p.StringProperty(name="Post-bake hook", description="""Call \
@@ -904,6 +1043,16 @@ class CubemapProperties(bpy.types.PropertyGroup):
     name = p.StringProperty(name="Probe Name", default="")
     size = p.IntProperty(name="Size", default=256)
     sky_only = p.BoolProperty(name="Sky only", default=False)
+
+    start_frame = p.IntProperty(name="Start Frame", subtype="UNSIGNED",
+            set=make_validator(validate_min_frame, "start_frame"),
+            get=get_field("start_frame", 1))
+    end_frame = p.IntProperty(name="End Frame", subtype="UNSIGNED", 
+            set=make_validator(validate_max_frame, "end_frame"),
+            get=get_field("end_frame", 1))
+    single_frame = p.BoolProperty(name="Just this frame")
+    whole_range = p.BoolProperty(name="Entire range")
+    fps = p.FloatProperty(name="Framerate", default=30.0)
     
     
 def register():
