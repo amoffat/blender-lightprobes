@@ -826,17 +826,36 @@ class BakeCubemapOperator(bpy.types.Operator):
         has_name = context.object.cubemap.name
         has_dir = context.scene.lightprobe.cubemap_dir
         return cycles and has_name and has_dir
+
+    def modal(self, ctx, event):
+        ret = {"PASS_THROUGH"}
+
+        if event.type == "TIMER":
+            try:
+                next(self.next_chunk)
+            except StopIteration:
+                ret = {"FINISHED"}
+
+        elif event.type in {"ESC", "RIGHTMOUSE"}:
+            self.cancel(ctx)
+            ret = {"CANCELLED"}
+
+        return ret
+
+    def cancel(self, ctx):
+        wm = ctx.window_manager
+        wm.event_timer_remove(self._timer)
     
-    def execute(self, context):
-        probe = context.object
-        scene = context.scene
+    def execute(self, ctx):
+        probe = ctx.object
+        scene = ctx.scene
         cube = probe.cubemap
         size = cube.size
         
         cubemap_dir = bpy.path.abspath(scene.lightprobe.cubemap_dir)
 
         def update_gen(num_frames):
-            wm = context.window_manager
+            wm = ctx.window_manager
             wm.progress_begin(0, (6*num_frames)-1)
             
             for i in range(6*num_frames):
@@ -887,27 +906,35 @@ class BakeCubemapOperator(bpy.types.Operator):
         out_handle = open(cubemap_filename, "wb")
         out_handle.write(struct.pack("<ffI", fps, gamma, len(all_frames)))
 
-        
-        with no_interfere_ctx():
-            restores = {
-                probe: hide_object(probe),
-            }
-            if cube.sky_only:
-                restores = hide_all(scene)
-            restores[probe]()
+        def fn():
+            with no_interfere_ctx():
+                restores = {
+                    probe: hide_object(probe),
+                }
+                if cube.sky_only:
+                    restores = hide_all(scene)
+                restores[probe]()
 
-            # for each frame that this cubemap is set to render for, render all
-            # six sides of the cube map
-            try:
-                for frame in all_frames:
-                    scene.frame_set(frame)
-                    render_cubemap(context, out_handle, probe, size, update_fn)
+                # for each frame that this cubemap is set to render for, render all
+                # six sides of the cube map
+                try:
+                    for frame in all_frames:
+                        scene.frame_set(frame)
+                        render_cubemap(ctx, out_handle, probe, size, update_fn)
+                        yield
 
-            finally:
-                for restore in restores.values():
-                    restore()
+                finally:
+                    for restore in restores.values():
+                        restore()
+
+
+        self.next_chunk = fn()
                     
-        return {"FINISHED"}
+        wm = ctx.window_manager
+        self._timer = wm.event_timer_add(0.5, ctx.window)
+        wm.modal_handler_add(self)
+
+        return {"RUNNING_MODAL"}
     
         
 class BakeOperator(bpy.types.Operator):
